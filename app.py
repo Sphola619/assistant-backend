@@ -17,6 +17,8 @@ MAX_WORKERS = 8
 QUOTE_CACHE_TTL_SECONDS = 15 * 60
 COMMENTARY_CACHE_TTL_SECONDS = 15 * 60
 GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MAX_RETRIES = 2
+GEMINI_RETRY_DELAY_SECONDS = 1.5
 
 
 def load_env_file() -> None:
@@ -438,23 +440,45 @@ def generate_commentary_with_gemini(symbol: str, quote: dict[str, Any], technica
         },
     }
 
-    response = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        headers={
-            "x-goog-api-key": gemini_api_key,
-            "Content-Type": "application/json",
-        },
-        json={
-            "system_instruction": {
-                "parts": [{"text": system_instruction}]
+    payload = None
+    last_http_error: requests.HTTPError | None = None
+
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={
+                "x-goog-api-key": gemini_api_key,
+                "Content-Type": "application/json",
             },
-            "contents": [{"parts": [{"text": json.dumps(user_payload)}]}],
-            "generationConfig": {"temperature": 0.2},
-        },
-        timeout=REQUEST_TIMEOUT_SECONDS + 10,
-    )
-    response.raise_for_status()
-    payload = response.json()
+            json={
+                "system_instruction": {
+                    "parts": [{"text": system_instruction}]
+                },
+                "contents": [{"parts": [{"text": json.dumps(user_payload)}]}],
+                "generationConfig": {"temperature": 0.2},
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS + 10,
+        )
+
+        try:
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except requests.HTTPError as error:
+            last_http_error = error
+            status_code = error.response.status_code if error.response is not None else None
+            is_retryable = status_code in {429, 500, 502, 503, 504}
+            has_more_attempts = attempt < GEMINI_MAX_RETRIES
+
+            if not (is_retryable and has_more_attempts):
+                raise
+
+            time.sleep(GEMINI_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    if payload is None:
+        if last_http_error is not None:
+            raise last_http_error
+        raise ValueError("Gemini returned no response payload.")
 
     text_parts = []
     for candidate in payload.get("candidates", []):
@@ -573,7 +597,15 @@ def ai_commentary():
         return jsonify(commentary)
     except requests.HTTPError as error:
         details = error.response.text if error.response is not None else str(error)
-        return jsonify({"error": "AI commentary request failed.", "details": details}), 502
+        status_code = error.response.status_code if error.response is not None else 502
+        if status_code == 503:
+            return jsonify(
+                {
+                    "error": "AI service is busy. Try again shortly.",
+                    "details": details,
+                }
+            ), 503
+        return jsonify({"error": "AI commentary request failed.", "details": details}), status_code
     except requests.RequestException as error:
         return jsonify({"error": "Unable to reach an upstream service.", "details": str(error)}), 502
     except Exception as error:
