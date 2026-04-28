@@ -598,13 +598,13 @@ def ai_commentary():
     except requests.HTTPError as error:
         details = error.response.text if error.response is not None else str(error)
         status_code = error.response.status_code if error.response is not None else 502
-        if status_code == 503:
+        if status_code in {429, 500, 502, 503, 504}:
             return jsonify(
                 {
-                    "error": "AI service is busy. Try again shortly.",
+                    "error": "Gemini is experiencing heavy traffic. Please try again shortly.",
                     "details": details,
                 }
-            ), 503
+            ), status_code
         return jsonify({"error": "AI commentary request failed.", "details": details}), status_code
     except requests.RequestException as error:
         return jsonify({"error": "Unable to reach an upstream service.", "details": str(error)}), 502
